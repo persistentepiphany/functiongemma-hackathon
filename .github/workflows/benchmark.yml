@@ -4,7 +4,7 @@ on:
   workflow_dispatch:  # manual trigger from GitHub UI
   push:
     branches: [main]
-    paths: [main.py]
+    paths: [main.py, .github/workflows/benchmark.yml]
 
 jobs:
   benchmark:
@@ -28,51 +28,14 @@ jobs:
       - name: Build cactus native library
         run: cd cactus/cactus && bash build.sh
 
-      - name: Download model weights
-        run: |
-          pip install huggingface_hub
-          python3 << 'PYEOF'
-          from huggingface_hub import hf_hub_download, list_repo_files
-          import zipfile, os
-
-          repo_id = "Cactus-Compute/functiongemma-270m-it"
-          out_dir = "cactus/weights/functiongemma-270m-it"
-          os.makedirs(out_dir, exist_ok=True)
-
-          # Find the apple or standard int8 zip
-          files = list_repo_files(repo_id, repo_type="model")
-          candidates = [
-              "weights/functiongemma-270m-it-int8-apple.zip",
-              "weights/functiongemma-270m-it-int8.zip",
-          ]
-          for c in candidates:
-              if c in files:
-                  print(f"Downloading {c}...")
-                  path = hf_hub_download(repo_id, c, repo_type="model")
-                  with zipfile.ZipFile(path) as z:
-                      z.extractall(out_dir)
-                  print(f"Extracted to {out_dir}")
-                  break
-          else:
-              # Fallback: download whatever zip is available
-              for f in sorted(files):
-                  if f.startswith("weights/") and f.endswith(".zip"):
-                      print(f"Downloading {f}...")
-                      path = hf_hub_download(repo_id, f, repo_type="model")
-                      with zipfile.ZipFile(path) as z:
-                          z.extractall(out_dir)
-                      print(f"Extracted to {out_dir}")
-                      break
-              else:
-                  raise RuntimeError(f"No weight zips found in {repo_id}. Files: {files}")
-
-          # Verify
-          assert os.path.exists(os.path.join(out_dir, "config.txt")), "config.txt missing after extraction"
-          print("Weights downloaded successfully!")
-          PYEOF
-
       - name: Install Python dependencies
-        run: pip install google-genai
+        run: pip install torch transformers sentencepiece huggingface_hub google-genai
+
+      - name: Download and convert model weights (reconvert from source)
+        run: |
+          cd cactus/python && python3 -m src download google/functiongemma-270m-it --reconvert
+          ls -la ../weights/functiongemma-270m-it/
+          test -f ../weights/functiongemma-270m-it/config.txt || (echo "ERROR: config.txt missing" && exit 1)
 
       - name: Run benchmark
         env:
