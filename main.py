@@ -11,12 +11,136 @@ from google.genai import types
 # ── Persistent model singleton: init once, reuse across calls ──
 _model = cactus_init(functiongemma_path)
 
+# ── Training-matched system prompt ──────────────────────────────
+# This is the EXACT trigger phrase from FunctionGemma's training data.
+# The chat template places it in <start_of_turn>developer, immediately
+# before <start_function_declaration> blocks.  Any extra instructions
+# here are noise the 270M model wasn't trained on — strip them.
 SYSTEM_PROMPT = (
-    "You are a function calling assistant. When the user asks you to do multiple things, "
-    "you MUST call ALL relevant functions. Make one function call per request. "
-    "Extract exact parameter values from the user message."
+    "You are a model that can do function calling with the following functions"
 )
 
+# ── Few-shot bank ───────────────────────────────────────────────
+# One known-good single-tool call per common tool name.
+# Used to prime the model with the exact output format it was
+# trained to produce:
+#   <start_function_call>call:NAME{key:<escape>val<escape>}<end_function_call>
+# Cactus's chat template converts the tool_calls dict below into
+# that format automatically.
+_FEWSHOT = {
+    "get_weather": (
+        "Weather in Tokyo?",
+        {"location": "Tokyo"},
+    ),
+    "set_alarm": (
+        "Alarm for 7 AM.",
+        {"hour": 7, "minute": 0},
+    ),
+    "send_message": (
+        "Text Bob saying hi.",
+        {"recipient": "Bob", "message": "hi"},
+    ),
+    "create_reminder": (
+        "Remind me about lunch at noon.",
+        {"title": "lunch", "time": "12:00 PM"},
+    ),
+    "search_contacts": (
+        "Find Alice in contacts.",
+        {"query": "Alice"},
+    ),
+    "play_music": (
+        "Play jazz.",
+        {"song": "jazz"},
+    ),
+    "set_timer": (
+        "3 minute timer.",
+        {"minutes": 3},
+    ),
+}
+
+
+def _pick_fewshot(tools, user_msg):
+    """Pick one few-shot example using a tool that ISN'T the likely target.
+
+    Avoids the model copying example arguments instead of extracting
+    from the real query.  Falls back to the first available match.
+    """
+    tool_names = [t["name"] for t in tools]
+    available = [n for n in tool_names if n in _FEWSHOT]
+    if not available:
+        return []
+
+    # Heuristic: skip tools whose name appears (partially) in the query
+    lower_msg = user_msg.lower()
+    safe = [n for n in available if n.split("_")[-1] not in lower_msg]
+    pick = safe[0] if safe else available[-1]
+
+    query, args = _FEWSHOT[pick]
+    return [
+        {"role": "user", "content": query},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "type": "function",
+                "function": {"name": pick, "arguments": args},
+            }],
+        },
+    ]
+
+
+def _optimize_tools(tools):
+    """Shorten descriptions to <10 words; add enum/range hints to params."""
+    out = []
+    for t in tools:
+        t = json.loads(json.dumps(t))  # deep copy
+        # Truncate description
+        words = t.get("description", "").split()
+        if len(words) > 9:
+            t["description"] = " ".join(words[:9])
+        # Enrich parameter descriptions with type hints
+        props = t.get("parameters", {}).get("properties", {})
+        for pname, pdef in props.items():
+            pdesc = pdef.get("description", "")
+            ptype = pdef.get("type", "")
+            low = pname.lower()
+            if ptype == "integer" and "hour" in low:
+                pdef["description"] = pdesc + " (0-23)" if pdesc else "Hour (0-23)"
+            elif ptype == "integer" and "minute" in low:
+                pdef["description"] = pdesc + " (0-59)" if pdesc else "Minute (0-59)"
+            elif ptype == "integer" and "minutes" in low:
+                pdef["description"] = pdesc + " (positive int)" if pdesc else "Minutes (positive int)"
+            # Add enum hint if enum values exist
+            if "enum" in pdef:
+                vals = ", ".join(str(v) for v in pdef["enum"][:5])
+                pdef["description"] = f"{pdesc} [{vals}]" if pdesc else f"[{vals}]"
+        out.append(t)
+    return out
+
+
+def _build_messages(messages, tools):
+    """Assemble the full message list for cactus_complete.
+
+    Layout matches FunctionGemma's training template:
+      <start_of_turn>developer
+      {SYSTEM_PROMPT}<function_declarations><end_of_turn>
+      <start_of_turn>user\n{few-shot query}<end_of_turn>
+      <start_of_turn>model\n<function_call>...<end_of_turn>
+      <start_of_turn>user\n{actual query}<end_of_turn>
+      <start_of_turn>model\n   ← generation starts here
+    """
+    user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_msg = m.get("content", "")
+            break
+
+    prompt = [{"role": "system", "content": SYSTEM_PROMPT}]
+    prompt += _pick_fewshot(tools, user_msg)
+    prompt += messages
+    return prompt
+
+
+# ─── Validation ─────────────────────────────────────────────────
 
 def _validate_local_result(function_calls, tools):
     """Accept local result if every call references a valid tool and has arguments."""
@@ -33,33 +157,20 @@ def _validate_local_result(function_calls, tools):
     return True
 
 
-def _estimate_expected_calls(user_message):
-    """Heuristic: count conjunctions/commas to guess how many calls are needed."""
-    text = user_message.lower()
-    count = 1
-    # " and " between clauses signals an extra action
-    count += text.count(" and ")
-    # ", " can also separate actions (but discount trailing commas / commas in values)
-    commas = text.count(", ")
-    # Avoid double-counting ", and"
-    commas -= text.count(", and")
-    count += max(0, commas)
-    return count
-
+# ─── Inference backends ─────────────────────────────────────────
 
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
     global _model
     cactus_reset(_model)
 
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
+    opt_tools = _optimize_tools(tools)
+    cactus_tools = [{"type": "function", "function": t} for t in opt_tools]
+    prompt = _build_messages(messages, opt_tools)
 
     raw_str = cactus_complete(
         _model,
-        [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        prompt,
         tools=cactus_tools,
         force_tools=True,
         temperature=0.0,
@@ -80,33 +191,18 @@ def generate_cactus(messages, tools):
             "confidence": 0,
         }
 
-    print(f"    [DEBUG] confidence={raw.get('confidence', '?'):.3f} cloud_handoff={raw.get('cloud_handoff', '?')} calls={raw.get('function_calls', [])} response={str(raw.get('response', ''))[:200]}")
+    print(
+        f"    [DEBUG] confidence={raw.get('confidence', '?'):.3f}"
+        f" cloud_handoff={raw.get('cloud_handoff', '?')}"
+        f" calls={raw.get('function_calls', [])}"
+        f" response={str(raw.get('response', ''))[:200]}"
+    )
 
     return {
         "function_calls": raw.get("function_calls", []),
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
-
-
-def generate_cactus_multipass(messages, tools):
-    """Run on-device inference with optional second pass for multi-call cases."""
-    result = generate_cactus(messages, tools)
-
-    user_msg = messages[-1]["content"] if messages else ""
-    expected = _estimate_expected_calls(user_msg)
-
-    if len(result["function_calls"]) < expected:
-        # Second pass to pick up missed calls
-        result2 = generate_cactus(messages, tools)
-        seen = {c["name"] for c in result["function_calls"]}
-        for call in result2["function_calls"]:
-            if call["name"] not in seen:
-                result["function_calls"].append(call)
-                seen.add(call["name"])
-        result["total_time_ms"] += result2["total_time_ms"]
-
-    return result
 
 
 def generate_cloud(messages, tools):
@@ -158,9 +254,15 @@ def generate_cloud(messages, tools):
     }
 
 
+# ─── Hybrid routing (submission interface) ──────────────────────
+
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Optimized hybrid: accept local result unless structurally invalid."""
-    local = generate_cactus_multipass(messages, tools)
+    """Local-first with cloud fallback.
+
+    Push 1: prompt format fix + few-shot + tool optimization.
+    No difficulty router yet — every query tries local first.
+    """
+    local = generate_cactus(messages, tools)
 
     if _validate_local_result(local["function_calls"], tools):
         local["source"] = "on-device"
@@ -174,7 +276,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         cloud["total_time_ms"] += local["total_time_ms"]
         return cloud
     except Exception:
-        # If cloud also fails, return local result anyway (partial > crash)
         local["source"] = "on-device"
         return local
 
