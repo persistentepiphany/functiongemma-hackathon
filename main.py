@@ -164,11 +164,16 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         return local
 
     # Fallback to cloud only when local output is empty or malformed
-    cloud = generate_cloud(messages, tools)
-    cloud["source"] = "cloud (fallback)"
-    cloud["local_confidence"] = local.get("confidence", 0)
-    cloud["total_time_ms"] += local["total_time_ms"]
-    return cloud
+    try:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        cloud["local_confidence"] = local.get("confidence", 0)
+        cloud["total_time_ms"] += local["total_time_ms"]
+        return cloud
+    except Exception:
+        # If cloud also fails, return local result anyway (partial > crash)
+        local["source"] = "on-device"
+        return local
 
 
 def print_result(label, result):
