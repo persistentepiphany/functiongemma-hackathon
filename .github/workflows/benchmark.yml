@@ -4,7 +4,7 @@ on:
   workflow_dispatch:  # manual trigger from GitHub UI
   push:
     branches: [main]
-    paths: [main.py, .github/workflows/benchmark.yml]
+    paths: [main.py, classifier.py, benchmark.py, .github/workflows/benchmark.yml]
 
 jobs:
   benchmark:

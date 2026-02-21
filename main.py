@@ -7,6 +7,7 @@ import json, os, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
+from classifier import classify_difficulty
 
 # ── Persistent model singleton: init once, reuse across calls ──
 _model = cactus_init(functiongemma_path)
@@ -169,9 +170,7 @@ def _build_messages(messages, tools):
             break
 
     prompt = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # NOTE: few-shot with tool_calls dicts removed — Cactus doesn't handle
-    # assistant messages containing tool_calls in input, which mangles the
-    # prompt template and produces garbage output (F1=0.00 in CI).
+    prompt += _pick_fewshot(tools, user_msg)
     prompt += messages
     return prompt
 
@@ -323,26 +322,55 @@ def generate_cloud(messages, tools):
 # ─── Hybrid routing (submission interface) ──────────────────────
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Local-first with multipass and cloud fallback.
+    """Difficulty-aware hybrid routing.
 
-    Push 2: adds description shortening, multipass for multi-call,
-    and validation pipeline. No difficulty router yet.
+    Classifies query difficulty BEFORE running inference, then picks
+    the cheapest path likely to succeed:
+
+        easy   → local only, no cloud overhead
+        medium → local first, validate, cloud fallback
+        hard   → direct to cloud, skip wasted local pass
     """
-    local = generate_cactus_multipass(messages, tools)
+    difficulty = classify_difficulty(messages, tools)
+    print(f"    [ROUTER] difficulty={difficulty}")
 
-    if _validate_local_result(local["function_calls"], tools):
-        local["source"] = "on-device"
-        return local
+    # ── easy: always local ──────────────────────────────────────
+    if difficulty == "easy":
+        result = generate_cactus(messages, tools)
+        result["source"] = "on-device"
+        result["difficulty"] = difficulty
+        return result
 
-    # Fallback to cloud only when local output is empty or malformed
+    # ── medium: local-first with cloud fallback ─────────────────
+    if difficulty == "medium":
+        local = generate_cactus_multipass(messages, tools)
+        if _validate_local_result(local["function_calls"], tools):
+            local["source"] = "on-device"
+            local["difficulty"] = difficulty
+            return local
+        try:
+            cloud = generate_cloud(messages, tools)
+            cloud["source"] = "cloud (fallback)"
+            cloud["difficulty"] = difficulty
+            cloud["local_confidence"] = local.get("confidence", 0)
+            cloud["total_time_ms"] += local["total_time_ms"]
+            return cloud
+        except Exception:
+            local["source"] = "on-device"
+            local["difficulty"] = difficulty
+            return local
+
+    # ── hard: direct to cloud ───────────────────────────────────
     try:
         cloud = generate_cloud(messages, tools)
-        cloud["source"] = "cloud (fallback)"
-        cloud["local_confidence"] = local.get("confidence", 0)
-        cloud["total_time_ms"] += local["total_time_ms"]
+        cloud["source"] = "cloud (direct)"
+        cloud["difficulty"] = difficulty
         return cloud
     except Exception:
-        local["source"] = "on-device"
+        # Cloud unreachable — last-resort local attempt
+        local = generate_cactus_multipass(messages, tools)
+        local["source"] = "on-device (cloud-failed)"
+        local["difficulty"] = difficulty
         return local
 
 
