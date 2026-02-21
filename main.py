@@ -3,7 +3,7 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, re, time
+import json, os, time, traceback
 from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
@@ -11,168 +11,6 @@ from classifier import classify_difficulty
 
 # ── Persistent model singleton: init once, reuse across calls ──
 _model = cactus_init(functiongemma_path)
-
-# ── Training-matched system prompt ──────────────────────────────
-# This is the EXACT trigger phrase from FunctionGemma's training data.
-# The chat template places it in <start_of_turn>developer, immediately
-# before <start_function_declaration> blocks.  Any extra instructions
-# here are noise the 270M model wasn't trained on — strip them.
-SYSTEM_PROMPT = (
-    "You are a model that can do function calling with the following functions"
-)
-
-# ── Few-shot bank ───────────────────────────────────────────────
-# One known-good single-tool call per common tool name.
-# Used to prime the model with the exact output format it was
-# trained to produce:
-#   <start_function_call>call:NAME{key:<escape>val<escape>}<end_function_call>
-# Cactus's chat template converts the tool_calls dict below into
-# that format automatically.
-_FEWSHOT = {
-    "get_weather": (
-        "Weather in Tokyo?",
-        {"location": "Tokyo"},
-    ),
-    "set_alarm": (
-        "Alarm for 7 AM.",
-        {"hour": 7, "minute": 0},
-    ),
-    "send_message": (
-        "Text Bob saying hi.",
-        {"recipient": "Bob", "message": "hi"},
-    ),
-    "create_reminder": (
-        "Remind me about lunch at noon.",
-        {"title": "lunch", "time": "12:00 PM"},
-    ),
-    "search_contacts": (
-        "Find Alice in contacts.",
-        {"query": "Alice"},
-    ),
-    "play_music": (
-        "Play jazz.",
-        {"song": "jazz"},
-    ),
-    "set_timer": (
-        "3 minute timer.",
-        {"minutes": 3},
-    ),
-}
-
-
-def _pick_fewshot(tools, user_msg):
-    """Pick one few-shot example using a tool that ISN'T the likely target.
-
-    Avoids the model copying example arguments instead of extracting
-    from the real query.  Falls back to the first available match.
-    """
-    tool_names = [t["name"] for t in tools]
-    available = [n for n in tool_names if n in _FEWSHOT]
-    if not available:
-        return []
-
-    # Heuristic: skip tools whose name appears (partially) in the query
-    lower_msg = user_msg.lower()
-    safe = [n for n in available if n.split("_")[-1] not in lower_msg]
-    pick = safe[0] if safe else available[-1]
-
-    query, args = _FEWSHOT[pick]
-    return [
-        {"role": "user", "content": query},
-        {
-            "role": "assistant",
-            "tool_calls": [{
-                "type": "function",
-                "function": {"name": pick, "arguments": args},
-            }],
-        },
-    ]
-
-
-# ── Filler patterns stripped from descriptions ─────────────────
-_FILLER = [
-    r"^the\s+", r"^a\s+", r"^an\s+",
-    r"^this\s+(is\s+)?", r"^that\s+",
-    r"^specifies\s+(the\s+)?", r"^indicates\s+(the\s+)?",
-    r"^represents\s+(the\s+)?", r"^contains\s+(the\s+)?",
-    r"^defines\s+(the\s+)?", r"^provides\s+(the\s+)?",
-    r"^determines\s+(the\s+)?",
-    r"\s+to\s+use\s+for\s+the\s+request\b",
-    r"\s+to\s+be\s+used\b",
-    r"\s+that\s+should\s+be\s+used\b",
-    r"\s+for\s+the\s+operation\b",
-    r"\s+of\s+the\s+result(s)?\b",
-    r"\s+in\s+the\s+response\b",
-    r"\.\s*$",
-]
-
-
-def _shorten(text, max_words):
-    """Shorten text to max_words, stripping filler first."""
-    if not text or not isinstance(text, str):
-        return text or ""
-    words = text.split()
-    if len(words) <= max_words:
-        return text
-    cleaned = text
-    for pat in _FILLER:
-        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
-    words = cleaned.split()
-    if len(words) <= max_words:
-        return cleaned
-    return " ".join(words[:max_words])
-
-
-def _optimize_tools(tools):
-    """Shorten descriptions, add range/enum hints for the 270M model."""
-    out = []
-    for t in tools:
-        t = json.loads(json.dumps(t))  # deep copy
-        # Truncate tool description to <10 words
-        t["description"] = _shorten(t.get("description", ""), 9)
-        # Optimize parameter descriptions
-        props = t.get("parameters", {}).get("properties", {})
-        for pname, pdef in props.items():
-            # Shorten param description to <8 words
-            if "description" in pdef:
-                pdef["description"] = _shorten(pdef["description"], 7)
-            pdesc = pdef.get("description", "")
-            ptype = pdef.get("type", "")
-            low = pname.lower()
-            if ptype == "integer" and "hour" in low:
-                pdef["description"] = pdesc + " (0-23)" if pdesc else "Hour (0-23)"
-            elif ptype == "integer" and "minute" in low:
-                pdef["description"] = pdesc + " (0-59)" if pdesc else "Minute (0-59)"
-            elif ptype == "integer" and "minutes" in low:
-                pdef["description"] = pdesc + " (positive int)" if pdesc else "Minutes (positive int)"
-            if "enum" in pdef:
-                vals = ", ".join(str(v) for v in pdef["enum"][:5])
-                pdef["description"] = f"{pdesc} [{vals}]" if pdesc else f"[{vals}]"
-        out.append(t)
-    return out
-
-
-def _build_messages(messages, tools):
-    """Assemble the full message list for cactus_complete.
-
-    Layout matches FunctionGemma's training template:
-      <start_of_turn>developer
-      {SYSTEM_PROMPT}<function_declarations><end_of_turn>
-      <start_of_turn>user\n{few-shot query}<end_of_turn>
-      <start_of_turn>model\n<function_call>...<end_of_turn>
-      <start_of_turn>user\n{actual query}<end_of_turn>
-      <start_of_turn>model\n   ← generation starts here
-    """
-    user_msg = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_msg = m.get("content", "")
-            break
-
-    prompt = [{"role": "system", "content": SYSTEM_PROMPT}]
-    prompt += _pick_fewshot(tools, user_msg)
-    prompt += messages
-    return prompt
 
 
 # ─── Validation ─────────────────────────────────────────────────
@@ -206,17 +44,23 @@ def _estimate_expected_calls(user_message):
 # ─── Inference backends ─────────────────────────────────────────
 
 def generate_cactus(messages, tools):
-    """Run function calling on-device via FunctionGemma + Cactus."""
+    """Run function calling on-device via FunctionGemma + Cactus.
+
+    NOTE: Do NOT prepend a system message — Cactus's Gemma chat template
+    auto-injects the FunctionGemma preamble ("You are a model that can do
+    function calling with the following functions.") into the developer
+    turn when tools are present. Adding our own system message duplicates
+    that preamble and confuses the 270M model.
+    """
     global _model
     cactus_reset(_model)
 
-    opt_tools = _optimize_tools(tools)
-    cactus_tools = [{"type": "function", "function": t} for t in opt_tools]
-    prompt = _build_messages(messages, opt_tools)
+    # Wrap raw tool dicts into OpenAI-style format expected by Cactus
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
 
     raw_str = cactus_complete(
         _model,
-        prompt,
+        messages,          # pass user messages directly, no system prompt
         tools=cactus_tools,
         force_tools=True,
         temperature=0.0,
@@ -355,7 +199,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             cloud["local_confidence"] = local.get("confidence", 0)
             cloud["total_time_ms"] += local["total_time_ms"]
             return cloud
-        except Exception:
+        except Exception as e:
+            print(f"    [CLOUD ERROR] fallback failed: {e}")
+            traceback.print_exc()
             local["source"] = "on-device"
             local["difficulty"] = difficulty
             return local
@@ -366,7 +212,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         cloud["source"] = "cloud (direct)"
         cloud["difficulty"] = difficulty
         return cloud
-    except Exception:
+    except Exception as e:
+        print(f"    [CLOUD ERROR] direct failed: {e}")
+        traceback.print_exc()
         # Cloud unreachable — last-resort local attempt
         local = generate_cactus_multipass(messages, tools)
         local["source"] = "on-device (cloud-failed)"
