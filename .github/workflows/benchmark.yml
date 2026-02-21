@@ -39,6 +39,16 @@ jobs:
           ls -la ../weights/functiongemma-270m-it/
           test -f ../weights/functiongemma-270m-it/config.txt || (echo "ERROR: config.txt missing" && exit 1)
 
+      - name: Fix tied embeddings (force separate output_weight.weights)
+        run: |
+          WEIGHTS_DIR=cactus/weights/functiongemma-270m-it
+          cp "$WEIGHTS_DIR/token_embeddings.weights" "$WEIGHTS_DIR/output_weight.weights"
+          sed -i '' 's/tie_word_embeddings=true/tie_word_embeddings=false/' "$WEIGHTS_DIR/config.txt"
+          echo "=== config.txt after fix ==="
+          cat "$WEIGHTS_DIR/config.txt"
+          echo "=== weight files ==="
+          ls -la "$WEIGHTS_DIR/"
+
       - name: Run benchmark
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
