@@ -3,7 +3,7 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
+import json, os, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
@@ -88,18 +88,53 @@ def _pick_fewshot(tools, user_msg):
     ]
 
 
+# ── Filler patterns stripped from descriptions ─────────────────
+_FILLER = [
+    r"^the\s+", r"^a\s+", r"^an\s+",
+    r"^this\s+(is\s+)?", r"^that\s+",
+    r"^specifies\s+(the\s+)?", r"^indicates\s+(the\s+)?",
+    r"^represents\s+(the\s+)?", r"^contains\s+(the\s+)?",
+    r"^defines\s+(the\s+)?", r"^provides\s+(the\s+)?",
+    r"^determines\s+(the\s+)?",
+    r"\s+to\s+use\s+for\s+the\s+request\b",
+    r"\s+to\s+be\s+used\b",
+    r"\s+that\s+should\s+be\s+used\b",
+    r"\s+for\s+the\s+operation\b",
+    r"\s+of\s+the\s+result(s)?\b",
+    r"\s+in\s+the\s+response\b",
+    r"\.\s*$",
+]
+
+
+def _shorten(text, max_words):
+    """Shorten text to max_words, stripping filler first."""
+    if not text or not isinstance(text, str):
+        return text or ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    cleaned = text
+    for pat in _FILLER:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+    words = cleaned.split()
+    if len(words) <= max_words:
+        return cleaned
+    return " ".join(words[:max_words])
+
+
 def _optimize_tools(tools):
-    """Shorten descriptions to <10 words; add enum/range hints to params."""
+    """Shorten descriptions, add range/enum hints for the 270M model."""
     out = []
     for t in tools:
         t = json.loads(json.dumps(t))  # deep copy
-        # Truncate description
-        words = t.get("description", "").split()
-        if len(words) > 9:
-            t["description"] = " ".join(words[:9])
-        # Enrich parameter descriptions with type hints
+        # Truncate tool description to <10 words
+        t["description"] = _shorten(t.get("description", ""), 9)
+        # Optimize parameter descriptions
         props = t.get("parameters", {}).get("properties", {})
         for pname, pdef in props.items():
+            # Shorten param description to <8 words
+            if "description" in pdef:
+                pdef["description"] = _shorten(pdef["description"], 7)
             pdesc = pdef.get("description", "")
             ptype = pdef.get("type", "")
             low = pname.lower()
@@ -109,7 +144,6 @@ def _optimize_tools(tools):
                 pdef["description"] = pdesc + " (0-59)" if pdesc else "Minute (0-59)"
             elif ptype == "integer" and "minutes" in low:
                 pdef["description"] = pdesc + " (positive int)" if pdesc else "Minutes (positive int)"
-            # Add enum hint if enum values exist
             if "enum" in pdef:
                 vals = ", ".join(str(v) for v in pdef["enum"][:5])
                 pdef["description"] = f"{pdesc} [{vals}]" if pdesc else f"[{vals}]"
@@ -135,7 +169,9 @@ def _build_messages(messages, tools):
             break
 
     prompt = [{"role": "system", "content": SYSTEM_PROMPT}]
-    prompt += _pick_fewshot(tools, user_msg)
+    # NOTE: few-shot with tool_calls dicts removed — Cactus doesn't handle
+    # assistant messages containing tool_calls in input, which mangles the
+    # prompt template and produces garbage output (F1=0.00 in CI).
     prompt += messages
     return prompt
 
@@ -155,6 +191,17 @@ def _validate_local_result(function_calls, tools):
         if not isinstance(call.get("arguments"), dict):
             return False
     return True
+
+
+def _estimate_expected_calls(user_message):
+    """Heuristic: count conjunctions/commas to guess how many calls are needed."""
+    text = user_message.lower()
+    count = 1
+    count += text.count(" and ")
+    commas = text.count(", ")
+    commas -= text.count(", and")
+    count += max(0, commas)
+    return count
 
 
 # ─── Inference backends ─────────────────────────────────────────
@@ -203,6 +250,25 @@ def generate_cactus(messages, tools):
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
+
+
+def generate_cactus_multipass(messages, tools):
+    """Run on-device inference with optional second pass for multi-call cases."""
+    result = generate_cactus(messages, tools)
+
+    user_msg = messages[-1]["content"] if messages else ""
+    expected = _estimate_expected_calls(user_msg)
+
+    if len(result["function_calls"]) < expected:
+        result2 = generate_cactus(messages, tools)
+        seen = {c["name"] for c in result["function_calls"]}
+        for call in result2["function_calls"]:
+            if call["name"] not in seen:
+                result["function_calls"].append(call)
+                seen.add(call["name"])
+        result["total_time_ms"] += result2["total_time_ms"]
+
+    return result
 
 
 def generate_cloud(messages, tools):
@@ -257,12 +323,12 @@ def generate_cloud(messages, tools):
 # ─── Hybrid routing (submission interface) ──────────────────────
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Local-first with cloud fallback.
+    """Local-first with multipass and cloud fallback.
 
-    Push 1: prompt format fix + few-shot + tool optimization.
-    No difficulty router yet — every query tries local first.
+    Push 2: adds description shortening, multipass for multi-call,
+    and validation pipeline. No difficulty router yet.
     """
-    local = generate_cactus(messages, tools)
+    local = generate_cactus_multipass(messages, tools)
 
     if _validate_local_result(local["function_calls"], tools):
         local["source"] = "on-device"
