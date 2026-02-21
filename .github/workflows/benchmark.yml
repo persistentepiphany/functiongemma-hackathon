@@ -32,8 +32,10 @@ jobs:
         run: pip install torch transformers sentencepiece huggingface_hub google-genai
 
       - name: Download and convert model weights (reconvert from source)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          cd cactus/python && python3 -m src download google/functiongemma-270m-it --reconvert
+          cd cactus/python && python3 -m src download google/functiongemma-270m-it --reconvert --token "$HF_TOKEN"
           ls -la ../weights/functiongemma-270m-it/
           test -f ../weights/functiongemma-270m-it/config.txt || (echo "ERROR: config.txt missing" && exit 1)
 
