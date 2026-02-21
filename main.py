@@ -73,11 +73,14 @@ def generate_cactus(messages, tools):
     try:
         raw = json.loads(raw_str)
     except json.JSONDecodeError:
+        print(f"    [DEBUG] JSON decode failed, raw_str={raw_str[:500]}")
         return {
             "function_calls": [],
             "total_time_ms": 0,
             "confidence": 0,
         }
+
+    print(f"    [DEBUG] confidence={raw.get('confidence', '?'):.3f} cloud_handoff={raw.get('cloud_handoff', '?')} calls={raw.get('function_calls', [])} response={str(raw.get('response', ''))[:200]}")
 
     return {
         "function_calls": raw.get("function_calls", []),

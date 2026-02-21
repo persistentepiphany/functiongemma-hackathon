@@ -408,6 +408,10 @@ def run_benchmark(benchmarks=None):
         f1 = compute_f1(result["function_calls"], case["expected_calls"])
         source = result.get("source", "unknown")
         print(f"F1={f1:.2f} | {result['total_time_ms']:.0f}ms | {source}")
+        if f1 < 1.0:
+            import json as _json
+            print(f"    PREDICTED: {_json.dumps(result['function_calls'], default=str)}")
+            print(f"    EXPECTED:  {_json.dumps(case['expected_calls'], default=str)}")
         results.append({
             "name": case["name"],
             "difficulty": case["difficulty"],
