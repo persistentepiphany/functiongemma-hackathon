@@ -33,7 +33,7 @@ jobs:
 
       - name: Download and convert model weights (reconvert from source)
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_API_KEY }}
         run: |
           cd cactus/python && python3 -m src download google/functiongemma-270m-it --reconvert --token "$HF_TOKEN"
           ls -la ../weights/functiongemma-270m-it/
